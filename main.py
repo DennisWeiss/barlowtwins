@@ -14,33 +14,45 @@ import signal
 import subprocess
 import sys
 import time
+import numpy as np
+from sklearn.neighbors import KNeighborsClassifier
+from tqdm import tqdm
+from sklearn.linear_model import LogisticRegression
 
-from PIL import Image, ImageOps, ImageFilter
+from models.LinearClassifier import LinearClassifier
+from save_representations import save_representations
+from transforms import Transform, EvalTransform
+
 from torch import nn, optim
 import torch
+import torch.utils.data
 import torchvision
 import torchvision.transforms as transforms
 
+from barlow_twins import BarlowTwins
+from datasets import NominalCIFAR10ImageDataset
+from visualize import draw_tsne_visualization
+
 parser = argparse.ArgumentParser(description='Barlow Twins Training')
-parser.add_argument('data', type=Path, metavar='DIR',
+parser.add_argument('data', default='./', type=Path, metavar='DIR',
                     help='path to dataset')
-parser.add_argument('--workers', default=8, type=int, metavar='N',
+parser.add_argument('--workers', default=1, type=int, metavar='N',
                     help='number of data loader workers')
 parser.add_argument('--epochs', default=1000, type=int, metavar='N',
                     help='number of total epochs to run')
-parser.add_argument('--batch-size', default=2048, type=int, metavar='N',
+parser.add_argument('--batch-size', default=128, type=int, metavar='N',
                     help='mini-batch size')
-parser.add_argument('--learning-rate-weights', default=0.2, type=float, metavar='LR',
+parser.add_argument('--learning-rate-weights', default=0.6, type=float, metavar='LR',
                     help='base learning rate for weights')
-parser.add_argument('--learning-rate-biases', default=0.0048, type=float, metavar='LR',
+parser.add_argument('--learning-rate-biases', default=0.015, type=float, metavar='LR',
                     help='base learning rate for biases and batch norm parameters')
 parser.add_argument('--weight-decay', default=1e-6, type=float, metavar='W',
                     help='weight decay')
 parser.add_argument('--lambd', default=0.0051, type=float, metavar='L',
                     help='weight on off-diagonal terms')
-parser.add_argument('--projector', default='8192-8192-8192', type=str,
+parser.add_argument('--projector', default='1024-1024-1024', type=str,
                     metavar='MLP', help='projector MLP')
-parser.add_argument('--print-freq', default=100, type=int, metavar='N',
+parser.add_argument('--print-freq', default=20, type=int, metavar='N',
                     help='print frequency')
 parser.add_argument('--checkpoint-dir', default='./checkpoint/', type=Path,
                     metavar='DIR', help='path to checkpoint directory')
@@ -70,10 +82,63 @@ def main():
     torch.multiprocessing.spawn(main_worker, (args,), args.ngpus_per_node)
 
 
+def evaluate_by_linear_probing(loader, model, gpu):
+    model.eval()
+    X = np.zeros((0, 512))
+    y = np.zeros(0)
+    for images, target in loader:
+        images = images.cuda(gpu, non_blocking=True)
+        with torch.no_grad():
+            X = np.append(X, model.module.backbone(images).cpu().numpy(), axis=0)
+        y = np.append(y, target.numpy(), axis=0)
+    clf = LogisticRegression(max_iter=2000)
+    # clf = KNeighborsClassifier(n_neighbors=20)
+
+    # normalize data
+    X = X - X.mean(axis=0)
+    X = X / (X.std(axis=0) + 1e-7)
+
+    clf.fit(X, y)
+    return clf.score(X, y)
+
+
+    # linear_classifier = LinearClassifier(2048, 10).cuda(gpu)
+    # linear_classifier.train()
+    #
+    # dataset = torch.utils.data.TensorDataset(torch.from_numpy(X).float(), torch.from_numpy(y).long())
+    # dataloader = torch.utils.data.DataLoader(dataset, batch_size=64)
+    #
+    # loss_fn = nn.CrossEntropyLoss()
+    #
+    # optimizer = optim.Adam(linear_classifier.parameters(), lr=1e-4)
+    #
+    # for epoch in range(200):
+    #     for x, y in tqdm(dataloader):
+    #         x = x.cuda(gpu, non_blocking=True)
+    #         y = y.cuda(gpu, non_blocking=True)
+    #
+    #         optimizer.zero_grad()
+    #
+    #         pred = linear_classifier(x)
+    #         loss = loss_fn(pred, y)
+    #         loss.backward()
+    #         optimizer.step()
+    #
+    # correct = 0
+    #
+    # for x, y in dataloader:
+    #     x = x.cuda(gpu, non_blocking=True)
+    #     y = y.cuda(gpu, non_blocking=True)
+    #     pred = linear_classifier(x)
+    #     correct += (pred.argmax(dim=1) == y).sum().item()
+    #
+    # return correct / len(dataset)
+
+
 def main_worker(gpu, args):
     args.rank += gpu
     torch.distributed.init_process_group(
-        backend='nccl', init_method=args.dist_url,
+        backend='gloo', init_method=args.dist_url,
         world_size=args.world_size, rank=args.rank)
 
     if args.rank == 0:
@@ -85,7 +150,7 @@ def main_worker(gpu, args):
     torch.cuda.set_device(gpu)
     torch.backends.cudnn.benchmark = True
 
-    model = BarlowTwins(args).cuda(gpu)
+    model = BarlowTwins(args.projector, args.batch_size, args.lambd).cuda(gpu)
     model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
     param_weights = []
     param_biases = []
@@ -110,46 +175,59 @@ def main_worker(gpu, args):
     else:
         start_epoch = 0
 
-    dataset = torchvision.datasets.ImageFolder(args.data / 'train', Transform())
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    assert args.batch_size % args.world_size == 0
-    per_device_batch_size = args.batch_size // args.world_size
-    loader = torch.utils.data.DataLoader(
-        dataset, batch_size=per_device_batch_size, num_workers=args.workers,
-        pin_memory=True, sampler=sampler)
+    draw_tsne_visualization(model, 0)
+    # save_representations(model, 0)
 
-    start_time = time.time()
-    scaler = torch.cuda.amp.GradScaler()
-    for epoch in range(start_epoch, args.epochs):
-        sampler.set_epoch(epoch)
-        for step, ((y1, y2), _) in enumerate(loader, start=epoch * len(loader)):
-            y1 = y1.cuda(gpu, non_blocking=True)
-            y2 = y2.cuda(gpu, non_blocking=True)
-            adjust_learning_rate(args, optimizer, loader, step)
-            optimizer.zero_grad()
-            with torch.cuda.amp.autocast():
-                loss = model.forward(y1, y2)
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
-            if step % args.print_freq == 0:
-                if args.rank == 0:
-                    stats = dict(epoch=epoch, step=step,
-                                 lr_weights=optimizer.param_groups[0]['lr'],
-                                 lr_biases=optimizer.param_groups[1]['lr'],
-                                 loss=loss.item(),
-                                 time=int(time.time() - start_time))
-                    print(json.dumps(stats))
-                    print(json.dumps(stats), file=stats_file)
-        if args.rank == 0:
-            # save checkpoint
-            state = dict(epoch=epoch + 1, model=model.state_dict(),
-                         optimizer=optimizer.state_dict())
-            torch.save(state, args.checkpoint_dir / 'checkpoint.pth')
-    if args.rank == 0:
-        # save final model
-        torch.save(model.module.backbone.state_dict(),
-                   args.checkpoint_dir / 'resnet50.pth')
+    # # train_dataset = torchvision.datasets.ImageFolder(args.data / 'train', Transform())
+    # # train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=Transform())
+    # train_dataset = NominalCIFAR10ImageDataset(nominal_class=0, train=True, transform=Transform())
+    # test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=EvalTransform())
+    # sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    # assert args.batch_size % args.world_size == 0
+    # per_device_batch_size = args.batch_size // args.world_size
+    # train_loader = torch.utils.data.DataLoader(
+    #     train_dataset, batch_size=per_device_batch_size, num_workers=args.workers,
+    #     pin_memory=True, sampler=sampler)
+    # test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=per_device_batch_size)
+    #
+    # start_time = time.time()
+    # scaler = torch.cuda.amp.GradScaler()
+    # for epoch in range(start_epoch, args.epochs):
+    #     model.train()
+    #     sampler.set_epoch(epoch)
+    #     # for step, (y1, y2) in enumerate(train_loader, start=epoch * len(train_loader)):
+    #     #     y1 = y1.cuda(gpu, non_blocking=True)
+    #     #     y2 = y2.cuda(gpu, non_blocking=True)
+    #     #     adjust_learning_rate(args, optimizer, train_loader, step)
+    #     #     optimizer.zero_grad()
+    #     #     with torch.cuda.amp.autocast():
+    #     #         loss = model.forward(y1, y2)
+    #     #     scaler.scale(loss).backward()
+    #     #     scaler.step(optimizer)
+    #     #     scaler.update()
+    #     #     if step % args.print_freq == 0:
+    #     #         if args.rank == 0:
+    #     #             stats = dict(epoch=epoch, step=step,
+    #     #                          lr_weights=optimizer.param_groups[0]['lr'],
+    #     #                          lr_biases=optimizer.param_groups[1]['lr'],
+    #     #                          loss=loss.item(),
+    #     #                          time=int(time.time() - start_time))
+    #     #             print(json.dumps(stats))
+    #     #             print(json.dumps(stats), file=stats_file)
+    #
+    #
+    #
+    #     print(f"Linear probing accuracy: {100 * evaluate_by_linear_probing(test_loader, model, gpu):.3f}%")
+    #
+    #     if args.rank == 0:
+    #         # save checkpoint
+    #         state = dict(epoch=epoch + 1, model=model.state_dict(),
+    #                      optimizer=optimizer.state_dict())
+    #         torch.save(state, args.checkpoint_dir / 'checkpoint.pth')
+    # if args.rank == 0:
+    #     # save final model
+    #     torch.save(model.module.backbone.state_dict(),
+    #                args.checkpoint_dir / 'resnet50.pth')
 
 
 def adjust_learning_rate(args, optimizer, loader, step):
@@ -175,50 +253,6 @@ def handle_sigusr1(signum, frame):
 
 def handle_sigterm(signum, frame):
     pass
-
-
-def off_diagonal(x):
-    # return a flattened view of the off-diagonal elements of a square matrix
-    n, m = x.shape
-    assert n == m
-    return x.flatten()[:-1].view(n - 1, n + 1)[:, 1:].flatten()
-
-
-class BarlowTwins(nn.Module):
-    def __init__(self, args):
-        super().__init__()
-        self.args = args
-        self.backbone = torchvision.models.resnet50(zero_init_residual=True)
-        self.backbone.fc = nn.Identity()
-
-        # projector
-        sizes = [2048] + list(map(int, args.projector.split('-')))
-        layers = []
-        for i in range(len(sizes) - 2):
-            layers.append(nn.Linear(sizes[i], sizes[i + 1], bias=False))
-            layers.append(nn.BatchNorm1d(sizes[i + 1]))
-            layers.append(nn.ReLU(inplace=True))
-        layers.append(nn.Linear(sizes[-2], sizes[-1], bias=False))
-        self.projector = nn.Sequential(*layers)
-
-        # normalization layer for the representations z1 and z2
-        self.bn = nn.BatchNorm1d(sizes[-1], affine=False)
-
-    def forward(self, y1, y2):
-        z1 = self.projector(self.backbone(y1))
-        z2 = self.projector(self.backbone(y2))
-
-        # empirical cross-correlation matrix
-        c = self.bn(z1).T @ self.bn(z2)
-
-        # sum the cross-correlation matrix between all gpus
-        c.div_(self.args.batch_size)
-        torch.distributed.all_reduce(c)
-
-        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-        off_diag = off_diagonal(c).pow_(2).sum()
-        loss = on_diag + self.args.lambd * off_diag
-        return loss
 
 
 class LARS(optim.Optimizer):
@@ -264,66 +298,7 @@ class LARS(optim.Optimizer):
 
 
 
-class GaussianBlur(object):
-    def __init__(self, p):
-        self.p = p
 
-    def __call__(self, img):
-        if random.random() < self.p:
-            sigma = random.random() * 1.9 + 0.1
-            return img.filter(ImageFilter.GaussianBlur(sigma))
-        else:
-            return img
-
-
-class Solarization(object):
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return ImageOps.solarize(img)
-        else:
-            return img
-
-
-class Transform:
-    def __init__(self):
-        self.transform = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                        saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=1.0),
-            Solarization(p=0.0),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-        self.transform_prime = transforms.Compose([
-            transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                        saturation=0.2, hue=0.1)],
-                p=0.8
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            GaussianBlur(p=0.1),
-            Solarization(p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                 std=[0.229, 0.224, 0.225])
-        ])
-
-    def __call__(self, x):
-        y1 = self.transform(x)
-        y2 = self.transform_prime(x)
-        return y1, y2
 
 
 if __name__ == '__main__':
