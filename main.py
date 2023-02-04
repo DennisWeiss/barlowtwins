@@ -21,7 +21,7 @@ from sklearn.linear_model import LogisticRegression
 
 from models.LinearClassifier import LinearClassifier
 from save_representations import save_representations
-from transforms import Transform, EvalTransform
+from transforms import Transform, EvalTransform, TransformWithRotation
 
 from torch import nn, optim
 import torch
@@ -52,9 +52,9 @@ parser.add_argument('--lambd', default=0.0051, type=float, metavar='L',
                     help='weight on off-diagonal terms')
 parser.add_argument('--projector', default='1024-1024-1024', type=str,
                     metavar='MLP', help='projector MLP')
-parser.add_argument('--print-freq', default=20, type=int, metavar='N',
+parser.add_argument('--print-freq', default=50, type=int, metavar='N',
                     help='print frequency')
-parser.add_argument('--checkpoint-dir', default='./checkpoint/', type=Path,
+parser.add_argument('--checkpoint-dir', default='./checkpoint_1/', type=Path,
                     metavar='DIR', help='path to checkpoint directory')
 
 
@@ -175,50 +175,50 @@ def main_worker(gpu, args):
     else:
         start_epoch = 0
 
-    draw_tsne_visualization(model, 0)
-    # save_representations(model, 0)
+    # draw_tsne_visualization(model, 1)
+    save_representations(model, 1)
 
-    # # train_dataset = torchvision.datasets.ImageFolder(args.data / 'train', Transform())
-    # # train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=Transform())
-    # train_dataset = NominalCIFAR10ImageDataset(nominal_class=0, train=True, transform=Transform())
-    # test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=EvalTransform())
-    # sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-    # assert args.batch_size % args.world_size == 0
-    # per_device_batch_size = args.batch_size // args.world_size
-    # train_loader = torch.utils.data.DataLoader(
-    #     train_dataset, batch_size=per_device_batch_size, num_workers=args.workers,
-    #     pin_memory=True, sampler=sampler)
-    # test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=per_device_batch_size)
-    #
-    # start_time = time.time()
-    # scaler = torch.cuda.amp.GradScaler()
+    # train_dataset = torchvision.datasets.ImageFolder(args.data / 'train', Transform())
+    train_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=Transform())
+    # train_dataset = NominalCIFAR10ImageDataset(nominal_class=1, train=True, transform=Transform())
+    test_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=EvalTransform())
+    sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
+    assert args.batch_size % args.world_size == 0
+    per_device_batch_size = args.batch_size // args.world_size
+    train_loader = torch.utils.data.DataLoader(
+        train_dataset, batch_size=per_device_batch_size, num_workers=args.workers,
+        pin_memory=True, sampler=sampler)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=per_device_batch_size)
+
+    start_time = time.time()
+    scaler = torch.cuda.amp.GradScaler()
     # for epoch in range(start_epoch, args.epochs):
-    #     model.train()
-    #     sampler.set_epoch(epoch)
-    #     # for step, (y1, y2) in enumerate(train_loader, start=epoch * len(train_loader)):
-    #     #     y1 = y1.cuda(gpu, non_blocking=True)
-    #     #     y2 = y2.cuda(gpu, non_blocking=True)
-    #     #     adjust_learning_rate(args, optimizer, train_loader, step)
-    #     #     optimizer.zero_grad()
-    #     #     with torch.cuda.amp.autocast():
-    #     #         loss = model.forward(y1, y2)
-    #     #     scaler.scale(loss).backward()
-    #     #     scaler.step(optimizer)
-    #     #     scaler.update()
-    #     #     if step % args.print_freq == 0:
-    #     #         if args.rank == 0:
-    #     #             stats = dict(epoch=epoch, step=step,
-    #     #                          lr_weights=optimizer.param_groups[0]['lr'],
-    #     #                          lr_biases=optimizer.param_groups[1]['lr'],
-    #     #                          loss=loss.item(),
-    #     #                          time=int(time.time() - start_time))
-    #     #             print(json.dumps(stats))
-    #     #             print(json.dumps(stats), file=stats_file)
-    #
-    #
-    #
-    #     print(f"Linear probing accuracy: {100 * evaluate_by_linear_probing(test_loader, model, gpu):.3f}%")
-    #
+        # model.train()
+        # sampler.set_epoch(epoch)
+        # for step, ((y1, y2), _) in enumerate(train_loader, start=epoch * len(train_loader)):
+        #     y1 = y1.cuda(gpu, non_blocking=True)
+        #     y2 = y2.cuda(gpu, non_blocking=True)
+        #     adjust_learning_rate(args, optimizer, train_loader, step)
+        #     optimizer.zero_grad()
+        #     with torch.cuda.amp.autocast():
+        #         loss = model.forward(y1, y2)
+        #     scaler.scale(loss).backward()
+        #     scaler.step(optimizer)
+        #     scaler.update()
+        #     if step % args.print_freq == 0:
+        #         if args.rank == 0:
+        #             stats = dict(epoch=epoch, step=step,
+        #                          lr_weights=optimizer.param_groups[0]['lr'],
+        #                          lr_biases=optimizer.param_groups[1]['lr'],
+        #                          loss=loss.item(),
+        #                          time=int(time.time() - start_time))
+        #             print(json.dumps(stats))
+        #             print(json.dumps(stats), file=stats_file)
+
+
+
+        # print(f"Linear probing accuracy: {100 * evaluate_by_linear_probing(test_loader, model, gpu):.3f}%")
+
     #     if args.rank == 0:
     #         # save checkpoint
     #         state = dict(epoch=epoch + 1, model=model.state_dict(),

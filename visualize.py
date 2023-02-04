@@ -23,11 +23,11 @@ def draw_tsne_visualization(model, normal_class):
     for x, y in loader:
         x = x.to('cuda')
         if y[0] == normal_class:
-            if count_normal >= 2000:
+            if count_normal >= 1000:
                 continue
             count_normal += 1
         else:
-            if count_anomalous >= 2000:
+            if count_anomalous >= 1000:
                 continue
             count_anomalous += 1
 

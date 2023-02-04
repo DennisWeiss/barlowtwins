@@ -1,6 +1,7 @@
 import torch
 from torch.utils.data import Dataset
 import torchvision
+import torchvision.transforms.functional as F
 
 
 class NominalCIFAR10ImageDataset(Dataset):
