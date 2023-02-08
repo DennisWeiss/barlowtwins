@@ -2,12 +2,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torchvision
+from tqdm import tqdm
 
 from barlow_twins import BarlowTwins
 from transforms import EvalTransform
 
 
 def save_representations(model, normal_class):
+    print('Saving representations...')
     data = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=EvalTransform())
     loader = torch.utils.data.DataLoader(data, batch_size=1, shuffle=True)
 
@@ -19,7 +21,7 @@ def save_representations(model, normal_class):
     count_normal = 0
     count_anomalous = 0
 
-    for x, y in loader:
+    for x, y in tqdm(loader):
         x = x.to('cuda')
         if y[0] == normal_class:
             if count_normal >= 3000:
